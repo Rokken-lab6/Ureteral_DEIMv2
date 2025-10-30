@@ -77,6 +77,7 @@ class BaseConfig(object):
         self.output_dir :str = None
         self.summary_dir :str = None
         self.device : str = ''
+        self.distance_threshold :float = 0.0
 
     @property
     def model(self, ) -> nn.Module:

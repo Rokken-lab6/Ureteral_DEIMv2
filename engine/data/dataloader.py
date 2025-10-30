@@ -24,6 +24,7 @@ from copy import deepcopy
 from PIL import Image, ImageDraw
 import os
 from collections import defaultdict, deque
+from pathlib import Path
 
 
 __all__ = [
@@ -34,9 +35,306 @@ __all__ = [
 ]
 
 
+class SequenceAwareBatchSampler(data.BatchSampler):
+    """Batch sampler that limits per-sequence usage and background frequency."""
+
+    def __init__(
+        self,
+        sampler,
+        batch_size,
+        drop_last,
+        *,
+        sequence_lookup=None,
+        is_background_lookup=None,
+        single_image_per_sequence=False,
+        background_image_per_batch=None,
+    ) -> None:
+        super().__init__(sampler, batch_size, drop_last)
+        self.single_image_per_sequence = single_image_per_sequence
+        self.background_image_per_batch = background_image_per_batch
+        self.sequence_lookup = sequence_lookup or {}
+        self.is_background_lookup = is_background_lookup or {}
+        self._planned_order = None
+        self._planned_length = None
+        self._plan_consumed = False
+        self._last_yielded = None
+        self._exhausted_early = False
+
+    def _get_sequence_id(self, index):
+        return self.sequence_lookup.get(index, index)
+
+    def _is_background(self, index):
+        return self.is_background_lookup.get(index, False)
+
+    def refresh_plan(self):
+        self._planned_order = None
+        self._planned_length = None
+        self._plan_consumed = False
+
+    def _ensure_plan(self):
+        if self._planned_order is not None:
+            return
+        order = list(self.sampler)
+        self._planned_length, exhausted = self._simulate_length(order)
+        self._planned_order = order
+        self._exhausted_early = exhausted
+        self._plan_consumed = False
+
+    def _simulate_length(self, order):
+        if not order:
+            return 0, False
+
+        indices_queue = deque(order)
+        total_batches = 0
+        exhausted = False
+        required_background = self.background_image_per_batch
+        if required_background is not None and required_background > self.batch_size:
+            return 0, True
+
+        while indices_queue:
+            batch = []
+            used_sequences = set()
+            background_count = 0
+            consecutive_failures = 0
+
+            while indices_queue and len(batch) < self.batch_size:
+                index = indices_queue.popleft()
+                seq_id = self._get_sequence_id(index)
+                is_background = self._is_background(index)
+                remaining_slots = self.batch_size - len(batch)
+                remaining_background_needed = (
+                    required_background - background_count if required_background is not None else 0
+                )
+                must_preserve_slot_for_background = (
+                    required_background is not None and not is_background and remaining_background_needed >= remaining_slots
+                )
+
+                violates_sequence = self.single_image_per_sequence and seq_id in used_sequences
+                violates_background = (
+                    required_background is not None
+                    and (
+                        (is_background and background_count >= required_background)
+                        or must_preserve_slot_for_background
+                    )
+                )
+
+                if violates_sequence or violates_background:
+                    indices_queue.append(index)
+                    consecutive_failures += 1
+                    if consecutive_failures >= len(indices_queue):
+                        break
+                    continue
+
+                batch.append(index)
+                if self.single_image_per_sequence:
+                    used_sequences.add(seq_id)
+                if required_background is not None and is_background:
+                    background_count += 1
+                consecutive_failures = 0
+
+            if len(batch) == self.batch_size and (
+                required_background is None or background_count == required_background
+            ):
+                total_batches += 1
+            else:
+                exhausted = True
+                break
+
+        return total_batches, exhausted
+
+    def __iter__(self):
+        if not self.single_image_per_sequence and self.background_image_per_batch is None:
+            yield from super().__iter__()
+            return
+
+        self._ensure_plan()
+        indices_queue = deque(self._planned_order)
+        yielded = 0
+        exhausted = False
+        required_background = self.background_image_per_batch
+        if required_background is not None and required_background > self.batch_size:
+            self._last_yielded = 0
+            self._exhausted_early = True
+            self._plan_consumed = True
+            self._planned_order = None
+            self._planned_length = None
+            return
+
+        while indices_queue:
+            batch = []
+            used_sequences = set()
+            background_count = 0
+            consecutive_failures = 0
+
+            while indices_queue and len(batch) < self.batch_size:
+                index = indices_queue.popleft()
+                seq_id = self._get_sequence_id(index)
+                is_background = self._is_background(index)
+                remaining_slots = self.batch_size - len(batch)
+                remaining_background_needed = (
+                    required_background - background_count if required_background is not None else 0
+                )
+                must_preserve_slot_for_background = (
+                    required_background is not None and not is_background and remaining_background_needed >= remaining_slots
+                )
+
+                violates_sequence = self.single_image_per_sequence and seq_id in used_sequences
+                violates_background = (
+                    required_background is not None
+                    and (
+                        (is_background and background_count >= required_background)
+                        or must_preserve_slot_for_background
+                    )
+                )
+
+                if violates_sequence or violates_background:
+                    indices_queue.append(index)
+                    consecutive_failures += 1
+                    if consecutive_failures >= len(indices_queue):
+                        break
+                    continue
+
+                batch.append(index)
+                if self.single_image_per_sequence:
+                    used_sequences.add(seq_id)
+                if required_background is not None and is_background:
+                    background_count += 1
+                consecutive_failures = 0
+
+            if len(batch) == self.batch_size and (
+                required_background is None or background_count == required_background
+            ):
+                yielded += 1
+                yield batch
+            else:
+                exhausted = True
+                break
+
+        self._last_yielded = yielded
+        self._exhausted_early = exhausted
+        self._plan_consumed = True
+        self._planned_order = None
+        self._planned_length = None
+
+    def __len__(self):
+        if not self.single_image_per_sequence and self.background_image_per_batch is None:
+            return super().__len__()
+        if self._planned_order is None:
+            if self._plan_consumed and self._last_yielded is not None:
+                return self._last_yielded
+            self._ensure_plan()
+        return self._planned_length or 0
+
+    @property
+    def last_yielded(self):
+        return self._last_yielded
+
+    @property
+    def exhausted_early(self):
+        return self._exhausted_early
+
+
 @register()
 class DataLoader(data.DataLoader):
     __inject__ = ['dataset', 'collate_fn']
+
+    def __init__(
+        self,
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        sampler=None,
+        batch_sampler=None,
+        num_workers=0,
+        collate_fn=None,
+        pin_memory=False,
+        drop_last=False,
+        timeout=0,
+        worker_init_fn=None,
+        multiprocessing_context=None,
+        generator=None,
+        *,
+        prefetch_factor=2,
+        persistent_workers=False,
+        pin_memory_device='',
+        single_image_per_sequence=False,
+        background_image_per_batch=None,
+        training_steps=None,
+        inference_batch_size=None,
+    ) -> None:
+        self.single_image_per_sequence = bool(single_image_per_sequence)
+        self.background_image_per_batch = (
+            int(background_image_per_batch) if background_image_per_batch is not None else None
+        )
+        self._training_steps = training_steps if training_steps is None else int(training_steps)
+        self.inference_batch_size = (
+            int(inference_batch_size) if inference_batch_size is not None else None
+        )
+        if self.inference_batch_size is not None and self.inference_batch_size <= 0:
+            raise ValueError('inference_batch_size must be positive if provided')
+        if self.background_image_per_batch is not None:
+            self.background_image_per_batch = max(0, self.background_image_per_batch)
+        if self._training_steps is not None and self._training_steps <= 0:
+            self._training_steps = None
+
+        use_sequence_sampler = (
+            (self.single_image_per_sequence or self.background_image_per_batch is not None)
+            and batch_sampler is None
+        )
+
+        sequence_lookup = {}
+        background_lookup = {}
+
+        self._last_epoch_steps = None
+        self._last_epoch_exhausted = False
+
+        init_kwargs = {
+            'dataset': dataset,
+            'num_workers': num_workers,
+            'collate_fn': collate_fn,
+            'pin_memory': pin_memory,
+            'timeout': timeout,
+            'worker_init_fn': worker_init_fn,
+            'multiprocessing_context': multiprocessing_context,
+            'generator': generator,
+            'prefetch_factor': prefetch_factor,
+            'persistent_workers': persistent_workers,
+            'pin_memory_device': pin_memory_device,
+        }
+
+        if use_sequence_sampler:
+            sequence_lookup, background_lookup = self._build_dataset_metadata(
+                dataset,
+                self.background_image_per_batch,
+            )
+
+            if sampler is None:
+                sampler = data.RandomSampler(dataset) if shuffle else data.SequentialSampler(dataset)
+
+            init_kwargs['batch_sampler'] = SequenceAwareBatchSampler(
+                sampler,
+                batch_size,
+                drop_last,
+                sequence_lookup=sequence_lookup,
+                is_background_lookup=background_lookup,
+                single_image_per_sequence=self.single_image_per_sequence,
+                background_image_per_batch=self.background_image_per_batch,
+            )
+        else:
+            init_kwargs.update(
+                {
+                    'batch_size': batch_size,
+                    'shuffle': shuffle,
+                    'sampler': sampler,
+                    'batch_sampler': batch_sampler,
+                    'drop_last': drop_last,
+                }
+            )
+
+        super().__init__(**init_kwargs)
+
+        self._sequence_lookup = sequence_lookup
+        self._is_background_lookup = background_lookup
 
     def __repr__(self) -> str:
         format_string = self.__class__.__name__ + "("
@@ -63,6 +361,102 @@ class DataLoader(data.DataLoader):
     def shuffle(self, shuffle):
         assert isinstance(shuffle, bool), 'shuffle must be a boolean'
         self._shuffle = shuffle
+
+    def __iter__(self):
+        base_iterator = super().__iter__()
+        counted = 0
+
+        if self._training_steps is not None and self._training_steps > 0:
+            for batch in base_iterator:
+                if counted >= self._training_steps:
+                    break
+                counted += 1
+                yield batch
+        else:
+            for batch in base_iterator:
+                counted += 1
+                yield batch
+
+        self._last_epoch_steps = counted
+
+        if isinstance(getattr(self, 'batch_sampler', None), SequenceAwareBatchSampler):
+            sampler = self.batch_sampler
+            self._last_epoch_exhausted = sampler.exhausted_early and (
+                self._training_steps is None or counted < self._training_steps
+            )
+            if sampler.last_yielded is not None and self._training_steps is None:
+                self._last_epoch_steps = sampler.last_yielded
+            if self._last_epoch_steps is not None:
+                status = ' (constraints reached)' if self._last_epoch_exhausted else ''
+                print(
+                    f"[DataLoader] Effective batches this epoch: {self._last_epoch_steps}{status}"
+                )
+
+    def __len__(self):
+        base_len = super().__len__()
+        if self._training_steps is None or self._training_steps <= 0:
+            if self._last_epoch_steps is not None:
+                return self._last_epoch_steps
+            return base_len
+        return min(self._training_steps, base_len)
+
+    @property
+    def last_epoch_steps(self):
+        return self._last_epoch_steps
+
+    @staticmethod
+    def _build_dataset_metadata(dataset, background_limit):
+        sequence_lookup = {}
+        background_lookup = {}
+
+        try:
+            if hasattr(dataset, 'coco') and hasattr(dataset, 'ids'):
+                coco = dataset.coco
+                for index, img_id in enumerate(dataset.ids):
+                    info = coco.loadImgs(img_id)[0]
+                    file_name = info.get('file_name', str(img_id))
+                    sequence_lookup[index] = DataLoader._extract_sequence_id(file_name)
+                    if background_limit is not None:
+                        ann_ids = coco.getAnnIds(imgIds=[img_id])
+                        background_lookup[index] = len(ann_ids) == 0
+            elif hasattr(dataset, 'imgs'):
+                entries = dataset.imgs
+                if isinstance(entries, dict):
+                    iterable = entries.values()
+                else:
+                    iterable = entries
+                for index, item in enumerate(iterable):
+                    if isinstance(item, (list, tuple)):
+                        path = item[0]
+                        target = item[1] if len(item) > 1 else None
+                    else:
+                        path, target = item, None
+                    sequence_lookup[index] = DataLoader._extract_sequence_id(path)
+                    if background_limit is not None:
+                        background_lookup[index] = DataLoader._is_empty_target(target)
+        except Exception:
+            sequence_lookup = {}
+            background_lookup = {}
+
+        return sequence_lookup, background_lookup
+
+    @staticmethod
+    def _extract_sequence_id(file_name):
+        path = Path(file_name)
+        if path.parent != Path('') and path.parent != Path('.'):
+            return path.parent.name
+        return path.stem
+
+    @staticmethod
+    def _is_empty_target(target):
+        if target is None:
+            return True
+        if isinstance(target, (list, tuple)):
+            return len(target) == 0
+        if isinstance(target, dict):
+            boxes = target.get('boxes') or target.get('annotations')
+            return not boxes
+        return False
 
 
 @register()

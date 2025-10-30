@@ -46,24 +46,27 @@ class DetSolver(BaseSolver):
         n_parameters = sum([p.numel() for p in self.model.parameters() if not p.requires_grad])
         print(f'number of non-trainable parameters: {n_parameters}')
 
-        top1 = 0
-        best_stat = {'epoch': -1, }
+        top1 = 0.0
+        best_stat = {'epoch': -1, 'best_f1': 0.0, 'best_f1_threshold': 0.0}
         # evaluate again before resume training
         if self.last_epoch > 0:
             module = self.ema.module if self.ema else self.model
-            test_stats, coco_evaluator = evaluate(
+            test_stats, _ = evaluate(
                 module,
                 self.criterion,
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                self.cfg.distance_threshold,
             )
-            for k in test_stats:
-                best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
-                print(f'best_stat: {best_stat}')
+            best_f1 = float(test_stats.get('best_f1', 0.0))
+            best_threshold = float(test_stats.get('best_f1_threshold', 0.0))
+            best_stat['epoch'] = self.last_epoch
+            best_stat['best_f1'] = best_f1
+            best_stat['best_f1_threshold'] = best_threshold
+            top1 = best_f1
+            print(f'best_stat: {best_stat}')
 
         best_stat_print = best_stat.copy()
         start_time = time.time()
@@ -112,58 +115,69 @@ class DetSolver(BaseSolver):
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
             module = self.ema.module if self.ema else self.model
-            test_stats, coco_evaluator = evaluate(
+            test_stats, _ = evaluate(
                 module,
                 self.criterion,
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                self.cfg.distance_threshold,
             )
 
-            for k in test_stats:
-                if self.writer and dist_utils.is_main_process():
-                    for i, v in enumerate(test_stats[k]):
-                        self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+            best_f1 = float(test_stats.get('best_f1', 0.0))
+            best_threshold = float(test_stats.get('best_f1_threshold', 0.0))
+            f1_per_threshold = test_stats.get('f1_per_threshold', {})
 
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+            if self.writer and dist_utils.is_main_process():
+                self.writer.add_scalar('Test/best_f1', best_f1, epoch)
+                self.writer.add_scalar('Test/best_f1_threshold', best_threshold, epoch)
+                for thr, value in f1_per_threshold.items():
+                    self.writer.add_scalar(f'Test/f1@{thr:.2f}', value, epoch)
 
-                if best_stat[k] > top1:
-                    best_stat_print['epoch'] = epoch
-                    top1 = best_stat[k]
-                    if self.output_dir:
-                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                        else:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
+            previous_best = best_stat.get('best_f1', float('-inf'))
+            if best_f1 > previous_best:
+                best_stat['epoch'] = epoch
+                best_stat['best_f1'] = best_f1
+                best_stat['best_f1_threshold'] = best_threshold
+            else:
+                best_stat['best_f1'] = max(previous_best, best_f1)
 
-                best_stat_print[k] = max(best_stat[k], top1)
-                print(f'best_stat: {best_stat_print}')  # global best
-
-                if best_stat['epoch'] == epoch and self.output_dir:
+            if best_stat.get('best_f1', 0.0) > top1:
+                top1 = best_stat['best_f1']
+                best_stat_print['epoch'] = best_stat['epoch']
+                best_stat_print['best_f1_threshold'] = best_stat.get('best_f1_threshold', 0.0)
+                if self.output_dir:
                     if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if test_stats[k][0] > top1:
-                            top1 = test_stats[k][0]
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
+                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
                     else:
-                        top1 = max(test_stats[k][0], top1)
                         dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
 
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    best_stat = {'epoch': -1, }
-                    self.ema.decay -= 0.0001
-                    self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
-                    print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
+            best_stat_print['best_f1'] = best_stat.get('best_f1', 0.0)
+            best_stat_print['best_f1_threshold'] = best_stat.get('best_f1_threshold', 0.0)
+            print(f'best_stat: {best_stat_print}')  # global best
 
+            if best_stat.get('epoch', -1) == epoch and self.output_dir:
+                if epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                    if best_f1 > top1:
+                        top1 = best_f1
+                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
+                else:
+                    top1 = max(best_f1, top1)
+                    dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
+
+            elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                best_stat = {'epoch': -1, 'best_f1': 0.0, 'best_f1_threshold': 0.0}
+                self.ema.decay -= 0.0001
+                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
             log_stats = {
                 **{f'train_{k}': v for k, v in train_stats.items()},
-                **{f'test_{k}': v for k, v in test_stats.items()},
+                'test_best_f1': best_f1,
+                'test_best_f1_threshold': best_threshold,
+                'test_best_f1_conf_threshold': best_threshold,
+                **{f'test_f1@{thr:.2f}': value for thr, value in f1_per_threshold.items()},
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
@@ -171,17 +185,6 @@ class DetSolver(BaseSolver):
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:
                     f.write(json.dumps(log_stats) + "\n")
-
-                # for evaluation logs
-                if coco_evaluator is not None:
-                    (self.output_dir / 'eval').mkdir(exist_ok=True)
-                    if "bbox" in coco_evaluator.coco_eval:
-                        filenames = ['latest.pth']
-                        if epoch % 50 == 0:
-                            filenames.append(f'{epoch:03}.pth')
-                        for name in filenames:
-                            torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                    self.output_dir / "eval" / name)
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -192,10 +195,21 @@ class DetSolver(BaseSolver):
         self.eval()
 
         module = self.ema.module if self.ema else self.model
-        test_stats, coco_evaluator = evaluate(module, self.criterion, self.postprocessor,
-                self.val_dataloader, self.evaluator, self.device)
+        test_stats, _ = evaluate(
+            module,
+            self.criterion,
+            self.postprocessor,
+            self.val_dataloader,
+            self.evaluator,
+            self.device,
+            self.cfg.distance_threshold,
+        )
 
-        if self.output_dir:
-            dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
+        print(f"Validation best F1: {test_stats.get('best_f1', 0.0):.4f} @ threshold {test_stats.get('best_f1_threshold', 0.0):.2f}")
+
+        if self.output_dir and dist_utils.is_main_process():
+            log_path = self.output_dir / "val_metrics.json"
+            with log_path.open("w") as f:
+                json.dump(test_stats, f)
 
         return

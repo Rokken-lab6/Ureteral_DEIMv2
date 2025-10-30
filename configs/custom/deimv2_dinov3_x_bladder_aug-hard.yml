@@ -108,6 +108,8 @@ val_dataloader:
         - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
   total_batch_size: 16
 
+distance_threshold: 96.0 # 162 * 640 / 1080
+
 DEIMCriterion:
   matcher:
     # new matcher
